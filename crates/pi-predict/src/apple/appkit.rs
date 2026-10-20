@@ -15,7 +15,7 @@
 use std::sync::LazyLock;
 
 use anyhow::Context;
-use objc2::rc::Retained;
+use objc2::rc::{Retained, autoreleasepool};
 use objc2_app_kit::NSSpellChecker;
 use objc2_foundation::{NSArray, NSRange, NSString, NSTextCheckingType};
 
@@ -26,8 +26,12 @@ static SPELLING_THREAD: LazyLock<flume::Sender<Job>> = LazyLock::new(|| {
 	std::thread::Builder::new()
 		.name("pi-native-spelling".into())
 		.spawn(move || {
+			// This thread never exits, so its implicit top-level pool never
+			// drains. Without a per-job pool every object AppKit autoreleases
+			// here (checking results, temporary strings, spelling-service XPC
+			// connections) stays alive for the life of the process.
 			while let Ok(job) = receiver.recv() {
-				job();
+				autoreleasepool(|_| job());
 			}
 		})
 		.expect("failed to spawn the native spelling thread");

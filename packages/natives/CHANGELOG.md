@@ -8,6 +8,10 @@
 - Reduced native memory-reranking allocations when candidate text contains repeated words ([#16348](https://github.com/can1357/oh-my-pi/pull/16348) by [@kyle-elliott](https://github.com/kyle-elliott))
 - Reduced allocation overhead when collecting directory grep results, including paginated searches ([#16226](https://github.com/can1357/oh-my-pi/pull/16226) by [@kyle-elliott](https://github.com/kyle-elliott))
 
+### Fixed
+
+- Fixed macOS spell checking steadily growing omp's memory and Mach port count over a long session
+
 ## [18.12.3] - 2026-10-19
 
 ### Added
