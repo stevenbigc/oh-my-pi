@@ -167,7 +167,7 @@ export async function loadAdvisorTranscriptCosts(
  * context resets/compacts independently, but every billed turn is appended here.
  */
 export class AdvisorTranscriptRecorder {
-	#manager: SessionManager | undefined;
+	#manager: Pick<SessionManager, "appendMessage" | "flush" | "close"> | undefined;
 	#file: string | undefined;
 	#filename: string;
 	/** Serializes the async open/close against synchronous appends so records land in order. */
@@ -269,10 +269,7 @@ export class AdvisorTranscriptRecorder {
 		this.#enqueue(async () => {
 			if (file !== this.#file) {
 				await this.#closeManager();
-				this.#manager = await SessionManager.open(file, undefined, undefined, {
-					initialCwd: cwd,
-					suppressBreadcrumb: true,
-				});
+				this.#manager = await SessionManager.openAppendOnly(file, { initialCwd: cwd });
 				this.#file = file;
 			}
 			this.#manager?.appendMessage(persisted);

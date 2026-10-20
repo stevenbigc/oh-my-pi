@@ -97,6 +97,7 @@ import {
 	resolveBlobRefsInEntriesSync,
 	type SessionLoadResult,
 	visitEntriesFromFile,
+	visitEntriesFromFileStream,
 } from "./session-loader";
 import { generateId, migrateToCurrentVersion } from "./session-migrations";
 import {
@@ -112,8 +113,10 @@ import { loadPinnedSessionIds, sortPinnedFirst } from "./session-pins";
 import {
 	FileSessionStorage,
 	MemorySessionStorage,
+	readSessionHeaderIdSync,
 	type SessionStorage,
 	type SessionStorageWriter,
+	type SessionStorageWriteOptions,
 	SessionWriteConflictError,
 } from "./session-storage";
 import { type SessionTitleUpdate, serializeTitleSlot } from "./session-title-slot";
@@ -909,6 +912,25 @@ export class SessionManager {
 	#hasTitleSlot = true;
 	#entries: SessionEntry[] = [];
 	#index = new SessionEntryIndex();
+	/**
+	 * Append-only states: hot retains only ids/leaf; rewriting hydrates durable
+	 * history under the publish gate; failed rewrites retain that body to keep
+	 * migrated ids stable; missing journals restart with pending entries only.
+	 * A foreign header permanently stops recording and drops all message
+	 * objects. Only ids/leaf and the persistence error survive that state.
+	 */
+	#appendOnly:
+		| {
+				ids: Set<string>;
+				sourceFile: string;
+				sourceId: string;
+				sourceSize: number | null;
+				stopped?: Error;
+				hydrated: boolean;
+				pending: SessionEntry[];
+				warnedMissing?: boolean;
+		  }
+		| undefined;
 
 	/** File reflects all current entries; appends can go incrementally. */
 	#fileIsCurrent = false;
@@ -1150,8 +1172,8 @@ export class SessionManager {
 	}
 
 	/** The entries `content` holds that this manager does not, or `undefined` when it is not this session's journal. */
-	#foreignEntriesIn(content: string): SessionEntry[] | undefined {
-		const { entries, invalidHeader } = parseSessionContent(content);
+	#foreignEntriesIn(content: string, loaded = parseSessionContent(content)): SessionEntry[] | undefined {
+		const { entries, invalidHeader } = loaded;
 		const header = entries[0];
 		if (invalidHeader || header?.type !== "session" || header.id !== this.#sessionId) return undefined;
 		const foreign: SessionEntry[] = [];
@@ -1176,6 +1198,7 @@ export class SessionManager {
 			if (this.#index.has(entry.id)) continue;
 			this.#entries.push(entry);
 			this.#index.insert(entry);
+			this.#appendOnly?.ids.add(entry.id);
 			adopted++;
 		}
 		this.#index.setLeaf(leaf);
@@ -1200,6 +1223,11 @@ export class SessionManager {
 	 * Returns the path to retry, or `undefined` to report the conflict as before.
 	 */
 	#recoverFromWriteConflictSync(error: unknown, recoveries: number): string | undefined {
+		if (this.#appendOnly && error instanceof SessionWriteConflictError) {
+			return error.path === this.#sessionFile && recoveries < MAX_WRITE_CONFLICT_RECOVERIES
+				? this.#sessionFile
+				: undefined;
+		}
 		const contested = this.#conflictedSessionFile(error);
 		if (!contested) return undefined;
 		if (recoveries >= MAX_WRITE_CONFLICT_RECOVERIES) return this.#moveOffSessionFile("contested");
@@ -1258,6 +1286,7 @@ export class SessionManager {
 	 * await it. Returns the sibling.
 	 */
 	#moveOffSessionFile(reason: SessionPersistenceNotice["reason"]): string {
+		this.#hydrateAppendOnlyEntries(true);
 		const from = this.#sessionFile as string;
 		const previousSessionId = this.#sessionId;
 		const timestamp = nowIso();
@@ -1273,6 +1302,11 @@ export class SessionManager {
 		this.#closeWriterEventually();
 		this.#sessionFile = to;
 		this.#expectedDiskSize = null;
+		if (this.#appendOnly) {
+			this.#appendOnly.sourceFile = to;
+			this.#appendOnly.sourceId = this.#sessionId;
+			this.#appendOnly.sourceSize = null;
+		}
 		this.#fileIsCurrent = false;
 		this.#rewriteRequired = true;
 		this.#artifactManager = null;
@@ -1500,6 +1534,7 @@ export class SessionManager {
 		this.#writer = this.#storage.openWriter(this.#sessionFile, {
 			flags: "a",
 			onError: err => this.#noteDiskFailure(err),
+			onFileChange: this.#appendOnly ? size => this.#checkAppendOnlyFileChange(size) : undefined,
 		});
 		return this.#writer;
 	}
@@ -1509,10 +1544,17 @@ export class SessionManager {
 	}
 	#recordDurableAppend(line: string): void {
 		this.#expectedDiskSize = (this.#expectedDiskSize ?? 0) + Buffer.byteLength(line, "utf8");
+		if (this.#appendOnly) this.#appendOnly.sourceSize = this.#expectedDiskSize;
 	}
 
 	#recordFullRewrite(bytes: number): void {
 		this.#expectedDiskSize = bytes;
+		const state = this.#appendOnly;
+		if (state) {
+			state.sourceFile = this.#sessionFile!;
+			state.sourceId = this.#sessionId;
+			state.sourceSize = bytes;
+		}
 	}
 
 	/**
@@ -1563,6 +1605,7 @@ export class SessionManager {
 
 	/** Serialize the whole file — title slot, header, entries — as lines, stamped with the state they came from. */
 	#serializeBody(): SessionFileBody {
+		this.#hydrateAppendOnlyEntries();
 		const titleLine = this.#titleSlotLine();
 		const headerLine = this.#lineFor(this.#header);
 		const entries = this.#entries;
@@ -1618,27 +1661,38 @@ export class SessionManager {
 	 */
 	#rewriteSynchronously(): void {
 		if (this.#released) return;
+		if (this.#appendOnly?.stopped) return;
 		if (!this.#persist || !this.#shouldHaveSessionFile()) return;
 		let targetPath = this.#liveRelocationWritePath() ?? this.#sessionFile;
 		if (!targetPath) return;
 
 		try {
 			if (this.#sessionOwnedElsewhere()) targetPath = this.#moveOffSessionFile("open-elsewhere");
-			let body = this.#serializeBody();
+			let body!: SessionFileBody;
+			if (!this.#appendOnly) body = this.#serializeBody();
 			this.#diskEpoch++;
 			this.#diskTail = Promise.resolve();
 			this.#closeWriterEventually();
 			for (let recoveries = 0; ; recoveries++) {
 				try {
-					const options = { expectedSize: this.#expectedDiskSize };
-					if (this.#storage.writeLinesSync) this.#storage.writeLinesSync(targetPath, body.lines, options);
+					const options: SessionStorageWriteOptions = {
+						expectedSize: this.#expectedDiskSize,
+						prepareLines: this.#appendOnly
+							? () => {
+									this.#hydrateAppendOnlyEntriesLocked();
+									body = this.#serializeBody();
+									return { lines: body.lines, expectedSize: this.#expectedDiskSize };
+								}
+							: undefined,
+					};
+					if (this.#storage.writeLinesSync) this.#storage.writeLinesSync(targetPath, body?.lines ?? [], options);
 					else this.#storage.writeTextSync(targetPath, body.lines.join(""), options);
 					break;
 				} catch (err) {
 					const retryPath = this.#recoverFromWriteConflictSync(err, recoveries);
 					if (!retryPath) throw err;
 					targetPath = retryPath;
-					body = this.#serializeBody();
+					if (!this.#appendOnly) body = this.#serializeBody();
 				}
 			}
 			this.#clearDiskError();
@@ -1913,6 +1967,12 @@ export class SessionManager {
 		} catch (err) {
 			this.#fileIsCurrent = false;
 			this.#rewriteRequired = true;
+			if (this.#appendOnly && !this.#appendOnly.stopped && err instanceof SessionWriteConflictError) {
+				// The writer detected a changed target under its publish gate.
+				// Re-read and prepare the full body under that same gate on retry.
+				this.#rewriteSynchronously();
+				return;
+			}
 			this.#noteDiskFailure(err);
 		}
 	}
@@ -2066,7 +2126,7 @@ export class SessionManager {
 
 	#freshEntryFields(): { id: string; parentId: string | null; timestamp: string; runtime: RuntimeIdentity } {
 		return {
-			id: generateId(this.#index),
+			id: generateId(this.#appendOnly?.ids ?? this.#index),
 			parentId: this.#index.leafId(),
 			timestamp: nowIso(),
 			runtime: currentRuntimeIdentity(),
@@ -2087,11 +2147,18 @@ export class SessionManager {
 			logger.warn("Dropped session entry appended after terminal release", { type: entry.type });
 			return;
 		}
+		if (this.#appendOnly?.stopped) {
+			this.#appendOnly.ids.add(entry.id);
+			this.#index.setLeaf(entry.id);
+			return;
+		}
 		if (entry.type === "message" && entry.message.role === "assistant" && normalizeAssistantUsage(entry.message)) {
 			logger.warn("Assistant message recorded with incomplete usage", { id: entry.id });
 		}
 		this.#entries.push(entry);
 		this.#index.insert(entry);
+		this.#appendOnly?.ids.add(entry.id);
+		this.#appendOnly?.pending.push(entry);
 		const batch = this.#atomicEntryBatch;
 		if (batch?.collecting) batch.entryIds.add(entry.id);
 		if (batch && !batch.collecting) {
@@ -2101,6 +2168,162 @@ export class SessionManager {
 		this.#appendToSessionFile(entry);
 		if (batch) batch.deferredNotifications.push(entry);
 		else this.#notifyEntryAppended(entry);
+		this.#releaseAppendOnlyEntries();
+	}
+
+	#stopAppendOnlyRecording(reason: string): Error {
+		const state = this.#appendOnly!;
+		if (!state.stopped) {
+			state.stopped = new Error(`Cannot append advisor transcript "${state.sourceFile}": ${reason}.`);
+			// A permanent refusal supersedes an earlier transient I/O error and
+			// reaches the normal persistence-error observers as well as the warn.
+			this.#clearDiskError();
+			this.#noteDiskFailure(state.stopped);
+			logger.warn("Advisor transcript recording permanently stopped; future messages will be discarded", {
+				sessionFile: state.sourceFile,
+				reason,
+			});
+		}
+		const leaf = this.#index.leafId();
+		state.pending = [];
+		state.hydrated = false;
+		this.#entries = [];
+		this.#index.clear();
+		this.#index.setLeaf(leaf);
+		return state.stopped;
+	}
+
+	/** Called only by the opt-in file writer while its publish gate is held. */
+	#checkAppendOnlyFileChange(size: number | null): void {
+		const state = this.#appendOnly!;
+		if (state.stopped) throw state.stopped;
+		const headerId = readSessionHeaderIdSync(state.sourceFile);
+		if (headerId !== undefined && headerId !== state.sourceId) {
+			throw this.#stopAppendOnlyRecording("the session header changed");
+		}
+		if (headerId === state.sourceId) {
+			if (size === this.#expectedDiskSize) return;
+			if (size !== null && this.#expectedDiskSize !== null && size > this.#expectedDiskSize) {
+				const fd = fs.openSync(state.sourceFile, "r");
+				try {
+					const tail = Buffer.alloc(1);
+					if (fs.readSync(fd, tail, 0, 1, size - 1) === 1 && tail[0] === 10) {
+						// A complete peer append needs no full read or rewrite, just
+						// the same durable-size reconciliation as the normal writer.
+						this.#expectedDiskSize = size;
+						state.sourceSize = size;
+						return;
+					}
+				} finally {
+					fs.closeSync(fd);
+				}
+			}
+		}
+		throw new SessionWriteConflictError(state.sourceFile, this.#expectedDiskSize, size);
+	}
+
+	#hydrateAppendOnlyEntries(force = false): void {
+		const state = this.#appendOnly;
+		if (!state || (state.hydrated && !force)) return;
+		(this.#storage as FileSessionStorage).withSessionPublishLockSync(state.sourceFile, () => {
+			this.#hydrateAppendOnlyEntriesLocked();
+		});
+	}
+
+	/** Read, reconcile and serialize before the storage releases its publish gate. */
+	#hydrateAppendOnlyEntriesLocked(): void {
+		const state = this.#appendOnly!;
+		if (state.stopped) throw state.stopped;
+		let content: string | null;
+		try {
+			content = this.#storage.readTextSync!(state.sourceFile);
+		} catch (error) {
+			if (!isEnoent(error)) throw error;
+			content = null;
+		}
+		const size = content === null ? null : Buffer.byteLength(content, "utf8");
+		const loaded = content === null ? undefined : parseSessionContent(content);
+		const header = loaded?.entries[0];
+		if (header?.type !== "session" || loaded?.invalidHeader) {
+			// A new sibling (or a retry of this reset) already has its intended
+			// header/history in memory. Unexpected deletion/truncation instead
+			// resets the on-disk cost history, as its previous turns are gone.
+			if (state.sourceSize === null && state.hydrated) {
+				this.#expectedDiskSize = size;
+				return;
+			}
+			if (!state.warnedMissing) {
+				state.warnedMissing = true;
+				logger.warn(
+					"Advisor transcript was deleted or has no header; starting a new journal without its old history",
+					{
+						sessionFile: state.sourceFile,
+					},
+				);
+			}
+			this.#sessionClaim?.release?.();
+			this.#sessionClaim = undefined;
+			const pending = state.pending;
+			this.#resetToNewSession(undefined, this.#sessionFile);
+			let parentId: string | null = null;
+			for (const entry of pending) {
+				entry.parentId = parentId;
+				parentId = entry.id;
+			}
+			this.#entries = [...pending];
+			this.#index.rebuild(pending);
+			this.#forceFileCreation = true;
+			this.#rewriteRequired = true;
+			this.#expectedDiskSize = size;
+			state.ids = new Set(pending.map(entry => entry.id));
+			state.sourceId = this.#sessionId;
+			state.sourceSize = null;
+			state.hydrated = true;
+			return;
+		}
+		if (header.id !== state.sourceId) throw this.#stopAppendOnlyRecording("the session header changed");
+		if (state.hydrated) {
+			// Keep once-migrated ids and already-sanitized initial history on
+			// failed rewrites. Current-version peer additions can still join it.
+			if ((header.version ?? 1) >= CURRENT_SESSION_VERSION) {
+				const foreign = this.#foreignEntriesIn(content!, loaded)!;
+				resolveBlobRefsInEntriesSync(foreign, this.#blobs);
+				this.#adoptForeignEntries(foreign, size!);
+			}
+			this.#expectedDiskSize = size;
+			return;
+		}
+		resolveBlobRefsInEntriesSync(loaded!.entries, this.#blobs);
+		const leaf = this.#index.leafId();
+		const pendingIds = new Set(state.pending.map(entry => entry.id));
+		const history = (loaded!.entries.slice(1) as SessionEntry[]).filter(entry => !pendingIds.has(entry.id));
+		normalizeLoadedUsage(history);
+		// Never re-sanitize messages authored by this live recorder.
+		this.#entries = [...history, ...state.pending];
+		this.#index.rebuild(history);
+		for (const entry of state.pending) {
+			if (entry.parentId !== null && !this.#index.has(entry.parentId)) entry.parentId = this.#index.leafId();
+			this.#index.insert(entry);
+		}
+		if (leaf !== null && this.#index.has(leaf)) this.#index.setLeaf(leaf);
+		for (const entry of history) state.ids.add(entry.id);
+		this.#expectedDiskSize = size;
+		state.hydrated = true;
+	}
+
+	#releaseAppendOnlyEntries(): void {
+		const state = this.#appendOnly;
+		if (!state) return;
+		const durable = !this.#diskFailure && this.#fileIsCurrent && !this.#rewriteRequired;
+		// In particular, keep the once-migrated v1 ids stable across a failed
+		// initial rewrite. Retrying must not re-migrate history from disk.
+		if (state.hydrated && !durable) return;
+		const leaf = this.#index.leafId();
+		if (durable) state.pending = [];
+		this.#entries = [...state.pending];
+		this.#index.clear();
+		this.#index.setLeaf(leaf);
+		state.hydrated = false;
 	}
 
 	#rollbackAtomicEntryBatch(batch: AtomicEntryBatch): void {
@@ -4182,6 +4405,95 @@ export class SessionManager {
 			history.push(entry);
 			parentId = id;
 		}
+	}
+
+	/**
+	 * File-backed append-only journal. Shares the normal header, persistence,
+	 * ownership, writer and recovery machinery without retaining durable turns.
+	 * The narrowed surface deliberately excludes tree navigation and mutation.
+	 */
+	static async openAppendOnly(
+		filePath: string,
+		options: { initialCwd: string },
+	): Promise<Pick<SessionManager, "appendMessage" | "flush" | "close">> {
+		const storage = new FileSessionStorage();
+		let header: SessionHeader | undefined;
+		const ids = new Set<string>();
+		let leaf: string | null = null;
+		let lastSelfSelected: string | null = null;
+		let bytes = 0;
+		let malformedRecords = 0;
+		let needsRewrite = false;
+		const titleSlot = await visitEntriesFromFileStream(
+			filePath,
+			entry => {
+				if (!header) {
+					if (entry?.type !== "session" || typeof entry.id !== "string") {
+						throw new Error(
+							`Cannot resume session "${filePath}": the session header is missing or malformed. The file was not modified.`,
+						);
+					}
+					header = entry;
+					return;
+				}
+				const sessionEntry = entry as SessionEntry;
+				ids.add(sessionEntry.id);
+				leaf = sessionEntryLeafId(sessionEntry);
+				if (leaf === sessionEntry.id) lastSelfSelected = leaf;
+				if (
+					sessionEntry.type === "message" &&
+					sessionEntry.message.role === "assistant" &&
+					sanitizeRehydratedOpenAIResponsesAssistantMessage(sessionEntry.message) !== sessionEntry.message
+				) {
+					needsRewrite = true;
+				}
+			},
+			{
+				onBytesConsumed: count => {
+					bytes += count;
+				},
+				onMalformedRecord: () => {
+					malformedRecords++;
+				},
+			},
+		);
+		if (!header && malformedRecords > 0) {
+			throw new Error(
+				`Cannot resume session "${filePath}": the session header is missing or malformed. The file was not modified.`,
+			);
+		}
+		needsRewrite ||= !!header && (header.version ?? 1) < CURRENT_SESSION_VERSION;
+		const recordedCwd = header?.cwd;
+		const cwd = recordedCwd && (await directoryIsEnterable(recordedCwd)) ? recordedCwd : options.initialCwd;
+		const manager = new SessionManager(cwd, path.dirname(path.resolve(filePath)), true, storage);
+		manager.#suppressBreadcrumb = true;
+		// Reuse the normal loader's cwd/header/title/usage/sanitize conventions.
+		// Only migration, sanitization or corruption needs a full loaded history.
+		const hydrateOnOpen = needsRewrite || malformedRecords > 0;
+		await manager.#setSessionFile(
+			filePath,
+			hydrateOnOpen
+				? undefined
+				: {
+						entries: header ? [header] : [],
+						titleSlot,
+						malformedRecords,
+						sourceSize: header || storage.existsSync(filePath) ? bytes : null,
+						invalidHeader: false,
+					},
+		);
+		if (!hydrateOnOpen) manager.#index.setLeaf(leaf !== null && !ids.has(leaf) ? lastSelfSelected : leaf);
+		manager.#appendOnly = {
+			ids: hydrateOnOpen ? new Set(manager.#entries.map(entry => entry.id)) : ids,
+			sourceFile: manager.#sessionFile!,
+			sourceId: manager.#sessionId,
+			sourceSize: manager.#expectedDiskSize,
+			hydrated: hydrateOnOpen,
+			pending: [],
+		};
+		if (manager.#rewriteRequired) manager.#rewriteSynchronously();
+		manager.#releaseAppendOnlyEntries();
+		return manager;
 	}
 
 	/**

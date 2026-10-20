@@ -93,10 +93,26 @@ export interface SessionStorageWriter {
 	getError(): Error | undefined;
 }
 
+export interface SessionStorageWriterOptions {
+	flags?: "a" | "w";
+	onError?: (err: Error) => void;
+	/**
+	 * File-only opt-in: inspect a new or changed live file under the append
+	 * publish gate, before writing or reopening its descriptor. Throw to leave
+	 * it untouched. Retries validate the new target through the same hook.
+	 */
+	onFileChange?: (size: number | null) => void;
+}
+
 /** Optimistic precondition for replacing a session file. */
 export interface SessionStorageWriteOptions {
 	/** Current UTF-8 byte length, or `null` when the target must not exist. */
 	expectedSize?: number | null;
+	/**
+	 * Synchronous file-only opt-in: prepare a replacement from the live journal while the
+	 * publish gate is held. The gate stays held through staging and publish.
+	 */
+	prepareLines?: () => { lines: readonly string[]; expectedSize: number | null };
 }
 
 /**
@@ -235,7 +251,7 @@ export interface SessionStorage {
 	 * cross-process conditional-delete primitive must skip opportunistic GC.
 	 */
 	deleteSessionWithArtifactsIf?(sessionPath: string, shouldDelete: (content: string) => boolean): Promise<boolean>;
-	openWriter(path: string, options?: { flags?: "a" | "w"; onError?: (err: Error) => void }): SessionStorageWriter;
+	openWriter(path: string, options?: SessionStorageWriterOptions): SessionStorageWriter;
 	/**
 	 * Wait for every backing write scheduled by this storage to become durably
 	 * visible. Sync backends (file, memory) return immediately because their
@@ -290,18 +306,20 @@ class FileSessionStorageWriter implements SessionStorageWriter {
 	#closed = false;
 	#error: Error | undefined;
 	#onError: ((err: Error) => void) | undefined;
+	#onFileChange: SessionStorageWriterOptions["onFileChange"];
+	#observedFile: fs.BigIntStats | undefined;
+	#checkedFile = false;
 
 	constructor(
 		fpath: string,
-		options?: {
-			flags?: "a" | "w";
-			onError?: (err: Error) => void;
+		options?: SessionStorageWriterOptions & {
 			publishLock?: (append: () => void, landed: () => boolean) => void;
 		},
 	) {
 		this.#fpath = fpath;
 		this.#publishLock = options?.publishLock;
 		this.#onError = options?.onError;
+		this.#onFileChange = options?.onFileChange;
 		const flags = options?.flags ?? "a";
 		// Ensure parent directory exists
 		const dir = path.dirname(fpath);
@@ -315,6 +333,7 @@ class FileSessionStorageWriter implements SessionStorageWriter {
 		);
 		// Register for cleanup if abandoned without close()
 		writerRegistry.register(this, this.#fd, this);
+		if (this.#onFileChange) this.#observedFile = fs.fstatSync(this.#fd, { bigint: true });
 	}
 
 	#heldFile(): { ino: bigint; dev: bigint } {
@@ -338,6 +357,18 @@ class FileSessionStorageWriter implements SessionStorageWriter {
 	#reopenIfReplaced(): number {
 		const held = this.#heldFile();
 		const live = statPathByHandle(this.#fpath);
+		if (
+			this.#onFileChange &&
+			(!this.#checkedFile ||
+				!live ||
+				live.ino !== this.#observedFile?.ino ||
+				live.dev !== this.#observedFile.dev ||
+				live.size !== this.#observedFile.size ||
+				live.mtimeNs !== this.#observedFile.mtimeNs)
+		) {
+			this.#onFileChange(live ? Number(live.size) : null);
+			this.#checkedFile = true;
+		}
 		if (!live) return fs.fstatSync(this.#fd).size;
 		if (live.ino === held.ino && live.dev === held.dev) return Number(live.size);
 		const nextFd = openCloexecSync(this.#fpath, SESSION_WRITE_FLAGS | fs.constants.O_APPEND);
@@ -429,13 +460,19 @@ class FileSessionStorageWriter implements SessionStorageWriter {
 		try {
 			if (this.#publishLock) {
 				this.#publishLock(
-					() => this.#writeNow(line, this.#reopenIfReplaced()),
+					() => {
+						this.#writeNow(line, this.#reopenIfReplaced());
+						if (this.#onFileChange) this.#observedFile = fs.fstatSync(this.#fd, { bigint: true });
+					},
 					() => this.#holdsLivePath(),
 				);
 			} else {
 				this.#writeNow(line, fs.fstatSync(this.#fd).size);
 			}
 		} catch (err) {
+			// An opt-in guard can request a cold reconcile without failing the
+			// descriptor or reporting an I/O error before that recovery is tried.
+			if (this.#onFileChange && err instanceof SessionWriteConflictError) throw err;
 			throw this.#recordError(err);
 		}
 	}
@@ -571,7 +608,7 @@ const SESSION_HEADER_PREFIX_BYTES = 64 * 1024;
  * synchronously from a bounded prefix (past the title slot), or `undefined`
  * when there is no readable file or no header in that prefix.
  */
-function readSessionHeaderIdSync(sessionPath: string): string | undefined {
+export function readSessionHeaderIdSync(sessionPath: string): string | undefined {
 	let prefix: string;
 	try {
 		const fd = fs.openSync(sessionPath, "r");
@@ -981,7 +1018,7 @@ export class FileSessionStorage implements SessionStorage {
 		this.ensureDirSync(dir);
 		const tempPath = sessionStagingPath(target);
 		try {
-			stage(tempPath);
+			if (!options?.prepareLines) stage(tempPath);
 		} catch (err) {
 			this.#discardTemp(tempPath, target);
 			throw toError(err);
@@ -991,7 +1028,13 @@ export class FileSessionStorage implements SessionStorage {
 		// append between the size check and the rename.
 		try {
 			this.#withPublishLock(target, () => {
-				this.#assertExpectedSize(target, options?.expectedSize);
+				let expectedSize = options?.expectedSize;
+				if (options?.prepareLines) {
+					const prepared = options.prepareLines();
+					writeLinesToFileSync(tempPath, prepared.lines);
+					expectedSize = prepared.expectedSize;
+				}
+				this.#assertExpectedSize(target, expectedSize);
 				try {
 					this.renameSync(tempPath, target);
 				} catch (err) {
@@ -1253,13 +1296,22 @@ export class FileSessionStorage implements SessionStorage {
 		return Promise.resolve();
 	}
 
-	openWriter(fpath: string, options?: { flags?: "a" | "w"; onError?: (err: Error) => void }): SessionStorageWriter {
+	openWriter(fpath: string, options?: SessionStorageWriterOptions): SessionStorageWriter {
 		const lockPath = this.#publishLockPath(fpath);
 		const gatePath = this.#osGatePath(lockPath);
 		return new FileSessionStorageWriter(fpath, {
 			...options,
 			publishLock: (append, landed) => this.#withAppendLock(fpath, lockPath, gatePath, append, landed),
 		});
+	}
+
+	/** Inspect live journal state under the same gate as appends and publishes. */
+	withSessionPublishLockSync<T>(fpath: string, operation: () => T): T {
+		let result!: T;
+		this.#withPublishLock(sessionPublishTarget(fpath), () => {
+			result = operation();
+		});
+		return result;
 	}
 
 	/** Run a synchronous session mutation under its cross-process lock. */
